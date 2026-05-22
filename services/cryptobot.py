@@ -8,19 +8,23 @@ from config import load_config
 _config = load_config()
 _BASE = "https://pay.crypt.bot/api"
 
+# Кэш юзернейма бота — заполняется при первом вызове
+_bot_username: str | None = None
+
 
 async def create_invoice(amount: float, description: str, user_id: int) -> str:
     """Create a USDT invoice and return the pay_url."""
     if not _config.cryptobot_token:
         raise RuntimeError("CRYPTOBOT_TOKEN not configured")
 
+    username = await _get_bot_username()
     payload = {
         "asset": "USDT",
         "amount": str(amount),
         "description": description,
         "payload": str(user_id),
         "paid_btn_name": "callback",
-        "paid_btn_url": f"https://t.me/{(await _get_bot_username())}",
+        "paid_btn_url": f"https://t.me/{username}",
         "allow_comments": False,
         "allow_anonymous": False,
     }
@@ -34,4 +38,14 @@ async def create_invoice(amount: float, description: str, user_id: int) -> str:
 
 
 async def _get_bot_username() -> str:
-    return "your_bot"  # fallback; ideally cached from bot.get_me()
+    """Получает юзернейм бота через Telegram API и кэширует его."""
+    global _bot_username
+    if _bot_username:
+        return _bot_username
+    import aiohttp as _aiohttp
+    url = f"https://api.telegram.org/bot{_config.bot_token}/getMe"
+    async with _aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.json()
+    _bot_username = data.get("result", {}).get("username", "bot")
+    return _bot_username
