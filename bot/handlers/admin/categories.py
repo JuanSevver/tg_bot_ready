@@ -289,6 +289,8 @@ async def cb_cat_delete(callback: CallbackQuery, state: FSMContext, session: Asy
         await session.delete(cat)
         await session.commit()
         await callback.answer("✅ Категория удалена.", show_alert=True)
+    else:
+        await callback.answer("Категория не найдена.", show_alert=True)
     result2 = await session.execute(select(Category).order_by(Category.id))
     cats = result2.scalars().all()
     await callback.message.edit_text(

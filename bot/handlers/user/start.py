@@ -119,21 +119,30 @@ async def process_captcha(message: Message, state: FSMContext, session: AsyncSes
         .where(User.id == user_id)
         .options(selectinload(User.subscription), selectinload(User.categories))
     )
-    user = result.scalar_one()
+    user = result.scalar_one_or_none()
+    if not user:
+        await message.answer("❌ Ошибка: пользователь не найден. Нажмите /start заново.")
+        await state.clear()
+        return
+
     user.captcha_passed = True
     user.receiving_enabled = True
 
-    if not user.trial_used:
+    # Пробная подписка — только если нет ни подписки, ни флага trial_used
+    if not user.trial_used and not user.subscription:
         expires = datetime.utcnow() + timedelta(days=3)
         sub = Subscription(user_id=user.id, plan="trial", expires_at=expires, purchases_count=0)
         session.add(sub)
         user.trial_used = True
 
+    # Добавляем только те категории которых ещё нет у пользователя
+    existing_cat_ids = {uc.category_id for uc in user.categories}
     cats_result = await session.execute(select(Category).where(Category.is_active == True))
     all_cats = cats_result.scalars().all()
     for cat in all_cats:
-        uc = UserCategory(user_id=user.id, category_id=cat.id, enabled=True)
-        session.add(uc)
+        if cat.id not in existing_cat_ids:
+            uc = UserCategory(user_id=user.id, category_id=cat.id, enabled=True)
+            session.add(uc)
 
     await session.commit()
     await session.refresh(user, ["subscription", "categories"])

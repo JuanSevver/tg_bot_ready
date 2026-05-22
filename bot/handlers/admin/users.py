@@ -105,7 +105,7 @@ async def cb_user_detail(callback: CallbackQuery, state: FSMContext, session: As
         f"🆔  ID: <code>{user.id}</code>\n"
         f"💬  Логин: {username_text}\n"
         f"📅  Дней в боте: <b>{days_using}</b>\n"
-        f"🕐  Последняя активность: <b>{user.last_active_at.strftime('%d.%m.%Y %H:%M')}</b>\n\n"
+        f"🕐  Последняя активность: <b>{user.last_active_at.strftime('%d.%m.%Y %H:%M') if user.last_active_at else '—'}</b>\n\n"
         f"💳  Подписка: {sub_status}\n"
         f"💰  Платных подписок: <b>{purchases}</b>"
     )

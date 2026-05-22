@@ -89,7 +89,7 @@ class CryptoBotPoller:
 
         matched_plan = None
         for plan_id, plan in plans.items():
-            if plan_id != "trial" and plan["price"] == amount:
+            if plan_id != "trial" and round(amount, 2) == plan["price"]:
                 matched_plan = (plan_id, plan)
                 break
 
