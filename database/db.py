@@ -11,7 +11,6 @@ async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncS
 
 @event.listens_for(engine.sync_engine, "connect")
 def _enable_sqlite_fk(dbapi_conn, _):
-    """Enable FK enforcement for every new SQLite connection."""
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()

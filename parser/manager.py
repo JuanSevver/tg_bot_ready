@@ -21,14 +21,13 @@ from telethon.errors import (
     AuthKeyUnregisteredError, UserDeactivatedError, FloodWaitError,
     SessionPasswordNeededError,
 )
-from thefuzz import fuzz
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from database.db import async_session
 from database.models import (
     ParserAccount, TelegramGroup, Category, UserCategory,
-    ParsedMessage, User, Subscription, CategoryAccount,
+    ParsedMessage, User, Subscription, CategoryAccount, GroupCategory,
 )
 from .client import make_client, proxy_tuple
 
@@ -37,67 +36,47 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Порог схожести для однословных ключей и минус-слов
-FUZZY_THRESHOLD = 82
-# Порог схожести для многословных фраз
-PHRASE_THRESHOLD = 78
+def _extract_username(link: str) -> str:
+    """Нормализует ссылку на группу к юзернейму (без @, в нижнем регистре).
+
+    Примеры:
+      https://t.me/mygroup  →  mygroup
+      @mygroup              →  mygroup
+      t.me/mygroup          →  mygroup
+    """
+    link = link.strip().lower()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if link.startswith(prefix):
+            link = link[len(prefix):]
+            break
+    link = link.lstrip("@")
+    # Убираем trailing slash, query params, пути вида joinchat/...
+    link = link.split("/")[0].split("?")[0]
+    return link
 
 
 def _match_phrase(phrase: str, text: str) -> bool:
-    """
-    Проверяет наличие фразы в тексте.
+    """Проверяет наличие ключевой фразы в тексте — строгий поиск подстрок.
 
-    Однословная фраза:
-      Нечёткое сравнение с каждым словом текста (token-level fuzzy).
-
-    Многословная фраза:
-      1. Сначала точное вхождение всей фразы как подстроки.
-      2. Затем скользящее окно по тексту той же длины.
+    Оба аргумента приводятся к нижнему регистру перед сравнением.
+    «дизайн» найдёт «дизайнер», «дизайна», «графическим дизайном» и т.д.
+    Многословная фраза «ищу дизайнера» найдёт только точное вхождение подстроки.
     """
     phrase = phrase.strip().lower()
     text = text.strip().lower()
-    phrase_words = phrase.split()
-    text_words = text.split()
-
-    if not phrase_words or not text_words:
+    if not phrase or not text:
         return False
-
-    # Однословная фраза — partial_ratio чтобы ловить словоформы
-    if len(phrase_words) == 1:
-        return any(fuzz.partial_ratio(phrase_words[0], w) >= FUZZY_THRESHOLD for w in text_words)
-
-    # Многословная фраза
-    # 1. Точное вхождение
-    if phrase in text:
-        return True
-
-    # 2. Скользящее окно
-    window_size = len(phrase_words) + 3
-    for i in range(max(1, len(text_words) - window_size + 1)):
-        window_words = text_words[i: i + window_size]
-        if all(
-            any(fuzz.ratio(pw, ww) >= FUZZY_THRESHOLD for ww in window_words)
-            for pw in phrase_words
-        ):
-            return True
-
-    return False
+    return phrase in text
 
 
 def _has_stop_word(stop_words: list[str], text: str) -> bool:
-    """Возвращает True если в тексте найдено хотя бы одно минус-слово."""
+    """Возвращает True если в тексте найдено хотя бы одно минус-слово (подстрока)."""
     text_lower = text.lower()
-    text_words = text_lower.split()
     for sw in stop_words:
         sw = sw.strip().lower()
-        if not sw:
-            continue
-        if sw in text_lower:
-            return True
-        if " " not in sw and any(fuzz.ratio(sw, w) >= FUZZY_THRESHOLD for w in text_words):
+        if sw and sw in text_lower:
             return True
     return False
-
 
 # Temporary storage for pending sign-ins: {phone: (client, phone_code_hash)}
 _pending: dict[str, tuple[TelegramClient, str]] = {}
@@ -115,6 +94,7 @@ class ParserManager:
 
     @property
     def _clients(self) -> list[TelegramClient]:
+        """Обратная совместимость: список клиентов без acc_id."""
         return [c for c, _ in self._client_pairs]
 
     def set_bot(self, bot: "Bot") -> None:
@@ -127,9 +107,9 @@ class ParserManager:
 
     async def stop(self) -> None:
         self._running = False
-        for c, _ in self._client_pairs:
+        for client in self._clients:
             try:
-                await c.disconnect()
+                await client.disconnect()
             except Exception:
                 pass
 
@@ -243,16 +223,30 @@ class ParserManager:
             for ca in ca_result.scalars().all():
                 cat_acc_map.setdefault(ca.category_id, set()).add(ca.account_id)
 
+            # Карта: group_id → list[Category]  (пусто = все категории)
+            gc_result = await session.execute(select(GroupCategory))
+            group_cat_map: dict[int, list[Category]] = {}
+            cat_by_id = {c.id: c for c in categories}
+            for gc in gc_result.scalars().all():
+                if gc.category_id in cat_by_id:
+                    group_cat_map.setdefault(gc.group_id, []).append(cat_by_id[gc.category_id])
+
         if not categories:
             return
 
-        explicit_links: set[str] = {g.link.lstrip("@").lower() for g in groups}
+        # Словарь username → TelegramGroup — для joined-групп
+        link_to_group: dict[str, TelegramGroup] = {
+            _extract_username(g.link): g for g in groups
+        }
+        explicit_links: set[str] = set(link_to_group.keys())
 
-        # 1. Явно добавленные группы (round-robin)
+        # 1. Явно добавленные группы (round-robin по клиентам)
         for group in groups:
             client, acc_id = next(self._cycle)
+            # Используем категории группы; если не назначены — все категории
+            group_cats = group_cat_map.get(group.id) or categories
             try:
-                await self._process_group(client, acc_id, group, categories, cat_acc_map)
+                await self._process_group(client, acc_id, group, group_cats, cat_acc_map)
             except FloodWaitError as e:
                 logger.warning("FloodWait %s sec for %s", e.seconds, group.link)
                 await asyncio.sleep(e.seconds)
@@ -262,7 +256,10 @@ class ParserManager:
         # 2. Группы в которых состоят аккаунты с parse_joined_groups=True
         for client, acc_id in self._joined_pairs:
             try:
-                await self._process_joined_groups(client, acc_id, categories, cat_acc_map, explicit_links)
+                await self._process_joined_groups(
+                    client, acc_id, categories, cat_acc_map,
+                    explicit_links, link_to_group, group_cat_map,
+                )
             except FloodWaitError as e:
                 logger.warning("FloodWait %s sec scanning joined groups", e.seconds)
                 await asyncio.sleep(e.seconds)
@@ -277,29 +274,47 @@ class ParserManager:
         categories: list[Category],
         cat_acc_map: dict[int, set[int]],
     ) -> None:
+        # Telethon принимает username (без @), полный URL t.me/... или числовой id
+        target = group.link
         async with async_session() as session:
             try:
-                async for message in client.iter_messages(group.link, limit=50):
+                # Определяем тип группы при первом обходе (канал или нет)
+                entity = await client.get_entity(target)
+                from telethon.tl.types import Channel
+                actually_channel = isinstance(entity, Channel) and entity.broadcast
+
+                # Если тип изменился с момента добавления — обновляем в БД
+                if group.is_channel != actually_channel:
+                    db_grp = await session.get(TelegramGroup, group.id)
+                    if db_grp:
+                        db_grp.is_channel = actually_channel
+                        await session.commit()
+                    group.is_channel = actually_channel  # обновляем и локальный объект
+
+                # Обычные сообщения группы / постов канала
+                async for message in client.iter_messages(entity, limit=50):
                     if not message.text:
                         continue
                     await self._handle_message(session, message, categories, acc_id, cat_acc_map)
 
-                # Комментарии к постам канала
+                # Если это канал — дополнительно парсим комментарии к постам
                 if group.is_channel:
-                    async for post in client.iter_messages(group.link, limit=20):
+                    async for post in client.iter_messages(entity, limit=20):
                         if not (post.replies and post.replies.replies):
                             continue
                         try:
                             async for comment in client.iter_messages(
-                                group.link, reply_to=post.id, limit=30
+                                entity, reply_to=post.id, limit=30
                             ):
                                 if not comment.text:
                                     continue
                                 await self._handle_message(session, comment, categories, acc_id, cat_acc_map)
                         except Exception:
-                            pass
+                            pass  # Не все каналы открыты для чтения комментариев
+            except FloodWaitError:
+                raise  # Пробрасываем — обрабатывается в _collect_messages
             except Exception as e:
-                logger.debug("Could not fetch history for %s: %s", group.link, e)
+                logger.warning("Could not process group %s: %s", group.link, e)
 
     async def _process_joined_groups(
         self,
@@ -308,8 +323,15 @@ class ParserManager:
         categories: list[Category],
         cat_acc_map: dict[int, set[int]],
         skip_links: set[str],
+        link_to_group: dict[str, "TelegramGroup"],
+        group_cat_map: dict[int, list[Category]],
     ) -> None:
-        """Сканирует все группы/каналы в которых состоит аккаунт."""
+        """Сканирует все группы/каналы в которых состоит аккаунт.
+
+        Если joined-группа совпадает с явно добавленной (по username) — пропускаем,
+        она уже обработана в round-robin. Если группа есть в БД и у неё назначены
+        категории — используем только их; иначе — все категории.
+        """
         try:
             dialogs = await client.get_dialogs()
         except Exception as e:
@@ -317,24 +339,36 @@ class ParserManager:
             return
 
         for dialog in dialogs:
+            # Только группы и каналы, пропускаем личные чаты и боты
             if not (dialog.is_group or dialog.is_channel):
                 continue
 
             entity = dialog.entity
             username = getattr(entity, "username", None)
-            if username and username.lower() in skip_links:
+            norm_username = _extract_username(username) if username else None
+
+            # Пропускаем явно добавленные группы (они уже обработаны round-robin)
+            if norm_username and norm_username in skip_links:
                 continue
 
             chat_id = dialog.id
             is_channel = dialog.is_channel and not dialog.is_group
+
+            # Выбираем категории: если группа есть в БД с назначенными → используем их
+            if norm_username and norm_username in link_to_group:
+                grp_db = link_to_group[norm_username]
+                group_cats = group_cat_map.get(grp_db.id) or categories
+            else:
+                group_cats = categories
 
             try:
                 async with async_session() as session:
                     async for message in client.iter_messages(chat_id, limit=50):
                         if not message.text:
                             continue
-                        await self._handle_message(session, message, categories, acc_id, cat_acc_map)
+                        await self._handle_message(session, message, group_cats, acc_id, cat_acc_map)
 
+                    # Комментарии к постам канала
                     if is_channel:
                         async for post in client.iter_messages(chat_id, limit=20):
                             if not (post.replies and post.replies.replies):
@@ -345,7 +379,7 @@ class ParserManager:
                                 ):
                                     if not comment.text:
                                         continue
-                                    await self._handle_message(session, comment, categories, acc_id, cat_acc_map)
+                                    await self._handle_message(session, comment, group_cats, acc_id, cat_acc_map)
                             except Exception:
                                 pass
             except FloodWaitError as e:
@@ -354,6 +388,7 @@ class ParserManager:
             except Exception as e:
                 logger.debug("Could not fetch joined group %s: %s", chat_id, e)
 
+            # Небольшая пауза между группами чтобы не флудить
             await asyncio.sleep(0.5)
 
     async def _handle_message(
@@ -367,7 +402,7 @@ class ParserManager:
         text = message.text or ""
         text_lower = text.lower()
 
-        # 1. Дедупликация по (group_id, message_id)
+        # 1. Дедупликация по (group_id, message_id) — одно и то же сообщение не обрабатываем дважды
         check = await session.execute(
             select(ParsedMessage).where(
                 ParsedMessage.group_id == message.chat_id,
@@ -377,11 +412,16 @@ class ParserManager:
         if check.scalar_one_or_none():
             return
 
-        # 2. Получаем отправителя
-        sender = await message.get_sender()
-        author_id = sender.id if sender else None
+        # 2. Получаем отправителя — сначала из кеша сообщения, API не вызываем
+        sender = message.sender  # уже загружен вместе с сообщением
+        if sender is None:
+            try:
+                sender = await message.get_sender()
+            except Exception:
+                sender = None
+        author_id = getattr(sender, "id", None)
 
-        # 3. Дедупликация по автору — тот же автор, тот же текст
+        # 3. Дедупликация по автору: если тот же автор уже присылал идентичный текст — пропускаем
         if author_id and text:
             author_dup = await session.execute(
                 select(ParsedMessage).where(
@@ -400,10 +440,12 @@ class ParserManager:
 
         matched_cat = None
         for cat in applicable:
+            # Проверяем минус-слова — если есть, категория не подходит
             stop_words = cat.get_stop_words()
             if stop_words and _has_stop_word(stop_words, text_lower):
                 continue
 
+            # Проверяем ключевые фразы
             for phrase in cat.get_keywords():
                 if _match_phrase(phrase, text_lower):
                     matched_cat = cat
@@ -425,7 +467,7 @@ class ParserManager:
             message_id=message.id,
             author_id=author_id,
             category_id=matched_cat.id,
-            text=text,
+            text=message.text,
             author_username=author_username,
             author_link=author_link,
         )
@@ -473,6 +515,7 @@ class ParserManager:
                     )
                     user.messages_received += 1
                 except TelegramRetryAfter as e:
+                    # Telegram просит подождать — соблюдаем
                     logger.warning("RetryAfter %s sec, pausing delivery.", e.retry_after)
                     await asyncio.sleep(e.retry_after)
                     try:
@@ -483,12 +526,13 @@ class ParserManager:
                     except Exception:
                         pass
                 except TelegramForbiddenError:
+                    # Пользователь заблокировал бота — отключаем ему рассылку
                     user.receiving_enabled = False
                     logger.info("User %s blocked the bot, disabling delivery.", user.id)
                 except Exception as e:
                     logger.debug("Deliver to user %s failed: %s", user.id, e)
 
-                # Throttle: не более 25 сообщений/сек
+                # Throttle: не более 25 сообщений/сек (лимит Telegram — 30/сек)
                 await asyncio.sleep(0.04)
 
             await session.commit()

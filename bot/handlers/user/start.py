@@ -21,11 +21,11 @@ router = Router(name="start")
 _config = load_config()
 
 WELCOME_TEXT = (
-    "👋 <b>Добро пожаловать!</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-    "Этот бот собирает актуальные <b>запросы</b> и <b>предложения</b> "
-    "из Telegram‑групп и присылает их прямо сюда — по твоим категориям, без дублей.\n\n"
-    "⚡ Просто пройди быструю проверку и начинай получать заявки!"
+    "Добро пожаловать!\n\n"
+    "Рад приветствовать вас в боте!\n\n"
+    "📍 Вся необходимая информация находится в разделах «Поддержка» или «Инструкция».\n\n"
+    "Также вы можете зайти в «Категории» и выбрать интересующие вас темы.\n\n"
+    "Приятного использования!"
 )
 
 CAPTCHA_TEXT = (
@@ -63,7 +63,15 @@ async def _get_or_create_user(session: AsyncSession, tg_user) -> User:
 
 
 async def _send_main_menu(message: Message | CallbackQuery, user: User) -> None:
-    text = "🏠 <b>Главное меню</b>\n━━━━━━━━━━━━━━━━━━━━━"
+    text = (
+        "🏠 <b>Главное меню</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Добро пожаловать!\n\n"
+        "Рад приветствовать вас в боте!\n\n"
+        "📍 Вся необходимая информация находится в разделах «Поддержка» или «Инструкция».\n\n"
+        "Также вы можете зайти в «Категории» и выбрать интересующие вас темы.\n\n"
+        "Приятного использования!"
+    )
     kb = main_menu_kb(user.receiving_enabled)
     if isinstance(message, Message):
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
@@ -122,23 +130,19 @@ async def process_captcha(message: Message, state: FSMContext, session: AsyncSes
     user = result.scalar_one_or_none()
     if not user:
         await message.answer("❌ Ошибка: пользователь не найден. Нажмите /start заново.")
-        await state.clear()
         return
-
     user.captcha_passed = True
     user.receiving_enabled = True
 
-    # Пробная подписка — только если нет ни подписки, ни флага trial_used
     if not user.trial_used and not user.subscription:
         expires = datetime.utcnow() + timedelta(days=3)
         sub = Subscription(user_id=user.id, plan="trial", expires_at=expires, purchases_count=0)
         session.add(sub)
         user.trial_used = True
 
-    # Добавляем только те категории которых ещё нет у пользователя
-    existing_cat_ids = {uc.category_id for uc in user.categories}
     cats_result = await session.execute(select(Category).where(Category.is_active == True))
     all_cats = cats_result.scalars().all()
+    existing_cat_ids = {uc.category_id for uc in user.categories}
     for cat in all_cats:
         if cat.id not in existing_cat_ids:
             uc = UserCategory(user_id=user.id, category_id=cat.id, enabled=True)

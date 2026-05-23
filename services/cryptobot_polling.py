@@ -1,9 +1,7 @@
 """
-CryptoBot payment polling.
-
-Каждые 30 секунд запрашивает список оплаченных счетов у CryptoBot
-и автоматически выдаёт подписку пользователю.
-Не требует домена и HTTPS.
+CryptoBot polling-based payment handler.
+Polls GET /getInvoices?status=paid every 30 seconds.
+No domain/HTTPS/webhook required.
 """
 from __future__ import annotations
 
@@ -12,6 +10,7 @@ import logging
 from datetime import datetime, timedelta
 
 import aiohttp
+from aiogram import Bot
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -21,46 +20,50 @@ from database.models import User, Subscription
 
 logger = logging.getLogger(__name__)
 _config = load_config()
-
 _BASE = "https://pay.crypt.bot/api"
-_POLL_INTERVAL = 30  # секунд
+
+POLL_INTERVAL = 30  # seconds
 
 
 class CryptoBotPoller:
     def __init__(self) -> None:
-        self._running = False
-        self._processed_invoice_ids: set[int] = set()
-        self._bot = None
+        self._bot: Bot | None = None
+        self._processed: set[int] = set()  # processed invoice IDs
+        self._task: asyncio.Task | None = None
 
-    def set_bot(self, bot) -> None:
+    def set_bot(self, bot: Bot) -> None:
         self._bot = bot
 
     async def start(self) -> None:
         if not _config.cryptobot_token:
-            logger.info("CRYPTOBOT_TOKEN not set — payment polling disabled.")
+            logger.warning("CRYPTOBOT_TOKEN not set — CryptoBot polling disabled.")
             return
-        self._running = True
-        asyncio.create_task(self._poll_loop())
-        logger.info("CryptoBot polling started (interval=%ss).", _POLL_INTERVAL)
+        self._task = asyncio.create_task(self._poll_loop())
+        logger.info("CryptoBot polling started (interval=%ds).", POLL_INTERVAL)
 
     async def stop(self) -> None:
-        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
     async def _poll_loop(self) -> None:
-        while self._running:
+        while True:
             try:
                 await self._check_invoices()
-            except Exception as e:
-                logger.error("CryptoBot polling error: %s", e)
-            await asyncio.sleep(_POLL_INTERVAL)
+            except Exception as exc:
+                logger.exception("CryptoBot polling error: %s", exc)
+            await asyncio.sleep(POLL_INTERVAL)
 
     async def _check_invoices(self) -> None:
         headers = {"Crypto-Pay-API-Token": _config.cryptobot_token}
-        params = {"status": "paid", "count": 100}
-
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"{_BASE}/getInvoices", headers=headers, params=params
+                f"{_BASE}/getInvoices",
+                params={"status": "paid", "count": 100},
+                headers=headers,
             ) as resp:
                 data = await resp.json()
 
@@ -68,16 +71,16 @@ class CryptoBotPoller:
             logger.warning("CryptoBot getInvoices error: %s", data)
             return
 
-        invoices = data.get("result", {}).get("items", [])
-        for invoice in invoices:
+        items = data.get("result", {}).get("items", [])
+        for invoice in items:
             invoice_id = invoice.get("invoice_id")
-            if invoice_id in self._processed_invoice_ids:
+            if not invoice_id or invoice_id in self._processed:
                 continue
 
-            self._processed_invoice_ids.add(invoice_id)
-            await self._process_invoice(invoice)
+            self._processed.add(invoice_id)
+            await self._handle_paid_invoice(invoice)
 
-    async def _process_invoice(self, invoice: dict) -> None:
+    async def _handle_paid_invoice(self, invoice: dict) -> None:
         user_id_str = invoice.get("payload", "")
         try:
             user_id = int(user_id_str)
@@ -86,7 +89,6 @@ class CryptoBotPoller:
 
         amount = float(invoice.get("amount", 0))
         plans = _config.SUBSCRIPTION_PLANS
-
         matched_plan = None
         for plan_id, plan in plans.items():
             if plan_id != "trial" and round(amount, 2) == plan["price"]:
@@ -94,13 +96,13 @@ class CryptoBotPoller:
                 break
 
         if not matched_plan:
-            logger.warning("No plan matched for amount %s USDT", amount)
+            logger.warning("No plan matched for invoice %s, amount=%s", invoice.get("invoice_id"), amount)
             return
 
         plan_id, plan = matched_plan
 
-        async with async_session() as session:
-            result = await session.execute(
+        async with async_session() as db:
+            result = await db.execute(
                 select(User).where(User.id == user_id).options(selectinload(User.subscription))
             )
             user = result.scalar_one_or_none()
@@ -126,23 +128,23 @@ class CryptoBotPoller:
                     expires_at=expires,
                     purchases_count=1,
                 )
-                session.add(sub)
+                db.add(sub)
 
-            await session.commit()
-            logger.info("Subscription %s granted to user %s via CryptoBot polling", plan_id, user_id)
+            await db.commit()
+            logger.info("Subscription %s granted to user %s via CryptoBot polling.", plan_id, user_id)
 
-        # Уведомляем пользователя
         if self._bot:
+            plan_label = plan.get("label", plan_id)
             try:
                 await self._bot.send_message(
                     user_id,
                     f"✅ <b>Оплата получена!</b>\n\n"
-                    f"Подписка <b>{plan['label']}</b> активирована.\n"
-                    f"Срок: <b>{days} дней</b>",
+                    f"💳 Подписка <b>{plan_label}</b> активирована на {days} дней.\n"
+                    "Используйте кнопку «Получать запросы» в главном меню.",
                     parse_mode="HTML",
                 )
             except Exception as e:
-                logger.debug("Could not notify user %s: %s", user_id, e)
+                logger.warning("Cannot notify user %s: %s", user_id, e)
 
 
 cryptobot_poller = CryptoBotPoller()

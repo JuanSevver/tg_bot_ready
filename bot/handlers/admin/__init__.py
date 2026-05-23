@@ -8,6 +8,7 @@ from .groups import router as groups_router
 from .accounts import router as accounts_router
 from .proxies import router as proxies_router
 from .categories import router as categories_router
+from .inline import router as inline_router
 
 admin_router = Router(name="admin")
 admin_router.message.filter(AdminFilter())
@@ -22,5 +23,8 @@ admin_router.include_routers(
     proxies_router,
     categories_router,
 )
+
+# Inline router without AdminFilter (filter checked inside handler)
+admin_router.include_router(inline_router)
 
 __all__ = ["admin_router"]

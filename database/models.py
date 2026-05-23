@@ -34,11 +34,10 @@ class User(Base):
     messages_received: Mapped[int] = mapped_column(Integer, default=0)
 
     subscription: Mapped[Subscription | None] = relationship(
-        "Subscription", back_populates="user", uselist=False,
-        cascade="all, delete-orphan",
+        "Subscription", back_populates="user", uselist=False, cascade="all, delete-orphan"
     )
     categories: Mapped[list[UserCategory]] = relationship(
-        "UserCategory", back_populates="user", cascade="all, delete-orphan", passive_deletes=True,
+        "UserCategory", back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
 
 
@@ -47,7 +46,7 @@ class Subscription(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), unique=True)
-    plan: Mapped[str] = mapped_column(String(16))  # trial / 1m / 3m / 1y / manual
+    plan: Mapped[str] = mapped_column(String(16))  # trial / 1m / 3m / 1y
     started_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime)
     purchases_count: Mapped[int] = mapped_column(Integer, default=0)  # paid only, trial excluded
@@ -71,8 +70,8 @@ class Category(Base):
     name: Mapped[str] = mapped_column(String(128))
     type: Mapped[CategoryType] = mapped_column(Enum(CategoryType))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    keywords: Mapped[str] = mapped_column(Text, default="")    # newline-separated phrases
-    stop_words: Mapped[str] = mapped_column(Text, default="")  # newline-separated words
+    keywords: Mapped[str] = mapped_column(Text, default="")   # newline-separated phrases
+    stop_words: Mapped[str] = mapped_column(Text, default="") # newline-separated words
 
     user_categories: Mapped[list[UserCategory]] = relationship(
         "UserCategory", back_populates="category", cascade="all, delete-orphan", passive_deletes=True,
@@ -86,13 +85,13 @@ class Category(Base):
 
     def get_keywords(self) -> list[str]:
         """Возвращает список фраз (каждая строка — отдельная фраза)."""
-        return [k.strip().lower() for k in self.keywords.splitlines() if k.strip()]
+        return [k.strip().lower() for k in (self.keywords or "").splitlines() if k.strip()]
 
     def set_keywords(self, kws: list[str]) -> None:
         self.keywords = "\n".join(k.strip().lower() for k in kws if k.strip())
 
     def get_stop_words(self) -> list[str]:
-        return [w.strip().lower() for w in self.stop_words.splitlines() if w.strip()]
+        return [w.strip().lower() for w in (self.stop_words or "").splitlines() if w.strip()]
 
     def set_stop_words(self, words: list[str]) -> None:
         self.stop_words = "\n".join(w.strip().lower() for w in words if w.strip())
@@ -121,9 +120,7 @@ class TelegramGroup(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
-    categories: Mapped[list[GroupCategory]] = relationship(
-        "GroupCategory", back_populates="group", cascade="all, delete-orphan", passive_deletes=True,
-    )
+    categories: Mapped[list[GroupCategory]] = relationship("GroupCategory", back_populates="group")
 
 
 class GroupCategory(Base):
